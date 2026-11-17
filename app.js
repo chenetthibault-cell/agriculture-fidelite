@@ -1,0 +1,726 @@
+﻿const $ = (id) => document.getElementById(id);
+const money = new Intl.NumberFormat('fr-FR', { style: 'currency', currency: 'EUR', maximumFractionDigits: 0 });
+let db = null;
+let deferredInstallPrompt = null;
+function setupInstallHelp() {
+  const help = $('installHelp');
+  const btn = $('installApp');
+  if (!help || !btn) return;
+  const ua = navigator.userAgent || '';
+  const isIos = /iphone|ipad|ipod/i.test(ua);
+  const isStandalone = window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone;
+  btn.hidden = false;
+  if (isStandalone) {
+    help.textContent = "Carte installée : ouvrez-la depuis votre écran d'accueil à chaque visite.";
+    btn.hidden = true;
+    return;
+  }
+  if (isIos) {
+    help.textContent = "Touchez le bouton pour voir les étapes d'installation sur iPhone ou Android.";
+    btn.textContent = "Voir l'aide";
+  } else if (deferredInstallPrompt) {
+    help.textContent = "Touchez Installer : la carte s'ajoute toute seule à votre écran d'accueil.";
+    btn.textContent = 'Installer';
+  } else {
+    help.textContent = "Touchez le bouton pour voir les étapes d'installation sur iPhone ou Android.";
+    btn.textContent = "Voir l'aide";
+  }
+}
+function openInstallHelp() {
+  $('installPanel').hidden = false;
+  setupInstallHelp();
+}
+async function triggerInstall() {
+  if (!deferredInstallPrompt) return openInstallHelp();
+  try {
+    deferredInstallPrompt.prompt();
+    const choice = await deferredInstallPrompt.userChoice;
+    deferredInstallPrompt = null;
+    setupInstallHelp();
+    if (!choice || choice.outcome !== 'accepted') openInstallHelp();
+  } catch {
+    deferredInstallPrompt = null;
+    openInstallHelp();
+  }
+}
+window.addEventListener('beforeinstallprompt', (event) => {
+  event.preventDefault();
+  deferredInstallPrompt = event;
+  const btn = $('installApp');
+  if (btn) { btn.hidden = false; btn.textContent = 'Installer'; }
+  setupInstallHelp();
+});
+window.addEventListener('appinstalled', () => {
+  deferredInstallPrompt = null;
+  $('installPanel').hidden = true;
+  setupInstallHelp();
+  toast("Carte ajoutée à votre écran d'accueil 🎉");
+});
+let state = { member: null, ranks: [], menu: null, adminPin: '', staffMode: false, adminMembers: [], rewardValues: {} };
+const STAFF_ENTRY_HASH = '#equipe-lagriculture';
+
+function toast(text) { $('toast').textContent = text; $('toast').hidden = false; setTimeout(() => $('toast').hidden = true, 2200); }
+function normalizePhone(v) { return String(v || '').replace(/[^\d+]/g, '').replace(/^0033/, '+33'); }
+function formatPhoneDisplay(v) { const digits = String(v || '').replace(/[^\d]/g, '').slice(0, 10); return digits.replace(/(\d{2})(?=\d)/g, '$1 '); }
+function normalizePin(v) { return String(v || '').replace(/[^\d]/g, ''); }
+function memberCode(phone) { return 'AGRI-' + String(phone || '').replace(/[^\d]/g, ''); }
+// QR généré directement dans le téléphone (bibliothèque locale qrcode.js) :
+// aucun service externe, donc aucune panne réseau possible et aucune donnée client ne sort.
+function qrUrl(data) {
+  try {
+    const qr = qrcode(0, 'M');
+    qr.addData(String(data));
+    qr.make();
+    return qr.createDataURL(8, 2);
+  } catch {
+    return '';
+  }
+}
+function fullName(member) { return [member?.first_name, member?.last_name].filter(Boolean).join(' ').trim(); }
+function escapeHtml(value) { return String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+function ensureConfig() {
+  if (!window.AGRI_SUPABASE_URL || window.AGRI_SUPABASE_URL.includes('REMPLACE_MOI')) {
+    toast('Configuration Supabase manquante');
+    return false;
+  }
+  db = window.supabase.createClient(window.AGRI_SUPABASE_URL, window.AGRI_SUPABASE_ANON_KEY);
+  return true;
+}
+async function checkAdmin() {
+  const pin = normalizePin(state.adminPin);
+  if (!pin) return false;
+  const { data, error } = await db.rpc('admin_ok', { p_pin: pin });
+  if (error) throw error;
+  return data === true;
+}
+async function loadPublicData() {
+  const ranksRes = await db.from('ranks').select('name,points_required,reward,sort_order').order('sort_order');
+  if (ranksRes.error) throw ranksRes.error;
+  state.ranks = ranksRes.data || [];
+  const menuRes = await db.from('daily_menu').select('*').eq('id', 1).single();
+  if (menuRes.error) throw menuRes.error;
+  state.menu = menuRes.data;
+  checkMenuUpdate(state.menu);
+  renderMenu();
+}
+function rankIndexFor(points) {
+  let idx = 0;
+  state.ranks.forEach((r, i) => { if (points >= Number(r.points_required)) idx = i; });
+  return idx;
+}
+function checkMenuUpdate(menu) {
+  if (!menu || !menu.updated_at) return;
+  const key = 'agriLastSeenMenuUpdatedAt';
+  const stored = localStorage.getItem(key);
+  const hasMember = !!localStorage.getItem('agriMemberCode') || !!localStorage.getItem('agriMemberPhone');
+  if (stored && stored !== menu.updated_at && hasMember) $('menuUpdateBanner').hidden = false;
+  localStorage.setItem(key, menu.updated_at);
+}
+function checkGradeUp(member) {
+  if (!state.ranks.length) return;
+  const idx = rankIndexFor(Number(member.points || 0));
+  const rank = state.ranks[idx];
+  const key = 'agriLastSeenRankIdx_' + member.code;
+  const stored = localStorage.getItem(key);
+  const storedIdx = stored === null ? null : Number(stored);
+  if (storedIdx !== null && idx > storedIdx) {
+    $('gradeUpTitle').textContent = 'Bravo, vous êtes ' + rank.name + ' !';
+    $('gradeUpText').textContent = 'Récompense débloquée : ' + (rank.reward || '');
+    $('gradeUpBanner').hidden = false;
+  }
+  localStorage.setItem(key, String(idx));
+}
+function rankFor(points) { return state.ranks.reduce((cur, rank) => points >= Number(rank.points_required) ? rank : cur, state.ranks[0] || { name: 'Stagiaire', points_required: 0, reward: '' }); }
+function nextRankFor(points) { return state.ranks.find(rank => Number(rank.points_required) > points) || rankFor(points); }
+function renderMenu() {
+  const m = state.menu || { starter: '', main: '', dessert: '', price: '' };
+  $('menuStarter').textContent = m.starter || '';
+  $('menuMain').textContent = m.main || '';
+  $('menuDessert').textContent = m.dessert || '';
+  $('menuPrice').textContent = m.price || '';
+  $('adminStarter').value = m.starter || '';
+  $('adminMain').value = m.main || '';
+  $('adminDessert').value = m.dessert || '';
+  $('adminPrice').value = m.price || '';
+}
+const CHALLENGE_TIERS = [{ tier: 1, visits: 5, points: 30 }, { tier: 2, visits: 10, points: 70 }];
+function currentPeriod() { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0'); }
+function visitsThisMonth(visits) {
+  const period = currentPeriod();
+  return (visits || []).filter(v => v.created_at && v.created_at.slice(0, 7) === period).length;
+}
+function renderChallenge(member) {
+  const card = $('challengeCard');
+  if (!card) return;
+  const visitCount = visitsThisMonth(member.visits || []);
+  const claimed = new Set((member.challenge_claims || []).map(c => Number(c.tier)));
+  const next = CHALLENGE_TIERS.find(t => !claimed.has(t.tier));
+  const btn = $('challengeClaim');
+  if (!next) {
+    card.hidden = false;
+    $('challengeText').textContent = 'Défi du mois réussi 🎉 Rendez-vous le mois prochain pour recommencer.';
+    $('challengeBar').style.width = '100%';
+    btn.hidden = true;
+    return;
+  }
+  card.hidden = false;
+  const ratio = Math.min(100, Math.round((visitCount / next.visits) * 100));
+  $('challengeBar').style.width = ratio + '%';
+  const remaining = Math.max(0, next.visits - visitCount);
+  if (remaining === 0) {
+    $('challengeText').textContent = 'Défi validé : ' + visitCount + '/' + next.visits + ' visites ce mois-ci !';
+    btn.hidden = false;
+    btn.textContent = 'Récupérer mes +' + next.points + ' pts';
+    btn.dataset.tier = String(next.tier);
+  } else {
+    $('challengeText').textContent = visitCount + '/' + next.visits + ' visites ce mois-ci — encore ' + remaining + ' pour +' + next.points + ' pts';
+    btn.hidden = true;
+  }
+}
+async function claimChallenge() {
+  const tier = Number($('challengeClaim').dataset.tier || 0);
+  if (!tier || !state.member) return;
+  const { data, error } = await db.rpc('claim_challenge', { p_code: state.member.code, p_tier: tier });
+  if (error) return toast(error.message);
+  toast('Bonus du défi récupéré ! 🔥');
+  renderClient(data);
+}
+function renderClient(member) {
+  state.member = member;
+  const points = Number(member.points || 0);
+  const rank = rankFor(points);
+  const next = nextRankFor(points);
+  checkGradeUp(member);
+  const base = Number(rank.points_required || 0);
+  const target = Number(next.points_required || base);
+  const maxed = target === base;
+  const ratio = maxed ? 100 : Math.min(100, Math.round(((points - base) / (target - base)) * 100));
+  const remaining = maxed ? 0 : Math.max(0, target - points);
+  $('welcomeName').textContent = member.first_name ? 'Bonjour ' + member.first_name : 'Bienvenue';
+  $('currentRank').textContent = rank.name;
+  $('pointsValue').textContent = points;
+  $('progressBar').style.width = ratio + '%';
+  $('rankProgressLabel').textContent = maxed
+    ? 'Grade maximum atteint 🎉'
+    : 'Plus que ' + remaining + ' point' + (remaining > 1 ? 's' : '') + ' avant ' + next.name;
+  $('nextRewardLabel').textContent = maxed ? rank.name + ' · grade actuel' : next.name + ' · ' + target + ' pts';
+  $('nextRewardText').textContent = (maxed ? rank.reward : next.reward) || '';
+  $('memberCode').textContent = member.code;
+  // Le QR ne contient que le code : le scanner récupère le nom depuis la base.
+  const qrSrc = qrUrl(member.code);
+  $('qrImage').src = qrSrc;
+  $('qrImage').hidden = !qrSrc;
+  renderHistory(member.visits || []);
+  renderChallenge(member);
+  renderRewards(points);
+  $('signinPanel').hidden = true;
+  $('clientApp').hidden = false;
+  localStorage.setItem('agriMemberCode', member.code);
+  if (member.phone) localStorage.setItem('agriMemberPhone', member.phone);
+}
+function renderHistory(visits) {
+  const list = $('historyList'); list.innerHTML = '';
+  if (!visits.length) { list.innerHTML = '<article class="history-item"><strong>Aucune visite enregistrée</strong><span>0 pt</span></article>'; return; }
+  let running = 0;
+  const withBalance = visits.map(v => { running += Number(v.points || 0); return Object.assign({}, v, { balance: running }); });
+  withBalance.slice().reverse().forEach(v => { const item = document.createElement('article'); item.className = 'history-item'; item.innerHTML = '<strong>' + new Date(v.created_at).toLocaleDateString('fr-FR') + '</strong><span>+' + v.points + ' pts · ' + money.format(v.amount) + '</span><small>Solde après visite : ' + v.balance + ' pts</small>'; list.appendChild(item); });
+}
+function renderRewardItem(list, rank, kind) {
+  const item = document.createElement('article');
+  item.className = 'reward-item' + (kind === 'locked' ? ' locked' : '') + (kind === 'redeemed' ? ' redeemed' : '');
+  const statusLabel = kind === 'redeemed' ? 'Déjà utilisé' : kind === 'available' ? 'Débloqué' : 'À venir';
+  item.innerHTML = '<strong>' + escapeHtml(rank.name) + '<small> · ' + Number(rank.points_required) + ' pts</small></strong><span>' + statusLabel + '</span><p>' + escapeHtml(rank.reward) + '</p>';
+  list.appendChild(item);
+}
+function renderRewardGroup(list, title, ranks, kind) {
+  if (!ranks.length) return;
+  const header = document.createElement('p');
+  header.className = 'client-group-title';
+  header.textContent = title;
+  list.appendChild(header);
+  ranks.forEach(rank => renderRewardItem(list, rank, kind));
+}
+function renderRewards(points) {
+  const list = $('rewardList'); list.innerHTML = '';
+  const used = state.member?.reward_redemptions || [];
+  const available = [], redeemed = [], locked = [];
+  state.ranks.forEach(rank => {
+    const unlocked = points >= Number(rank.points_required);
+    const isRedeemed = used.some(r => r.rank_name === rank.name && Number(r.points_required) === Number(rank.points_required));
+    if (isRedeemed) redeemed.push(rank);
+    else if (unlocked) available.push(rank);
+    else locked.push(rank);
+  });
+  renderRewardGroup(list, '🎁 À récupérer', available, 'available');
+  renderRewardGroup(list, '✅ Déjà utilisés', redeemed, 'redeemed');
+  renderRewardGroup(list, '🔒 À venir', locked, 'locked');
+}
+async function getMemberWithVisits(code) {
+  const { data, error } = await db.rpc('get_member_card', { p_code: code });
+  if (error) throw error;
+  return data;
+}
+async function refreshMember() {
+  let code = localStorage.getItem('agriMemberCode');
+  if (!code && localStorage.getItem('agriMemberPhone')) code = memberCode(localStorage.getItem('agriMemberPhone'));
+  if (!code) return;
+  try {
+    const member = await getMemberWithVisits(code);
+    if (member) renderClient(member);
+  } catch (error) {
+    toast(error.message || 'Connexion client à actualiser');
+  }
+}
+async function signup(e) {
+  e.preventDefault();
+  const firstName = $('firstNameInput').value.trim();
+  const lastNameField = $('lastNameInput');
+  const lastName = lastNameField ? lastNameField.value.trim() : '';
+  const phone = normalizePhone($('phoneInput').value);
+  if (!firstName || phone.length < 8) return toast('Prénom et téléphone requis');
+  const code = memberCode(phone);
+  const { data, error } = await db.rpc('signup_member', { p_first_name: firstName, p_last_name: lastName, p_phone: phone, p_code: code });
+  if (error) return toast(error.message);
+  const member = data || await getMemberWithVisits(code);
+  localStorage.setItem('agriMemberPhone', phone);
+  renderClient(member);
+}
+async function unlockAdmin() {
+  state.adminPin = normalizePin($('adminPinInput').value);
+  $('adminPinInput').value = state.adminPin;
+  try {
+    if (!(await checkAdmin())) { state.adminPin = ''; return toast('Code admin incorrect'); }
+  } catch (error) {
+    state.adminPin = '';
+    return toast(error.message || 'Connexion admin impossible');
+  }
+  localStorage.setItem('agriAdminPin', state.adminPin);
+  $('pinPanel').hidden = true;
+  await openAdmin();
+}
+async function tryStoredAdmin() {
+  const stored = localStorage.getItem('agriAdminPin');
+  if (!stored) return;
+  state.adminPin = stored;
+  $('pinPanel').hidden = true;
+  await openAdmin();
+}
+async function openAdmin() {
+  try {
+    if (!(await checkAdmin())) { localStorage.removeItem('agriAdminPin'); state.adminPin = ''; $('pinPanel').hidden = false; return; }
+    $('adminPanel').hidden = false;
+    await loadAdmin();
+  } catch (error) {
+    localStorage.removeItem('agriAdminPin');
+    state.adminPin = '';
+    $('pinPanel').hidden = false;
+    toast(error.message || 'Accès admin impossible');
+  }
+}
+async function loadAdmin() {
+  const { data, error } = await db.rpc('admin_dashboard', { p_pin: state.adminPin });
+  if (error) throw error;
+  state.adminMembers = data?.members || [];
+  const admins = data?.admins || [];
+  $('statClients').textContent = state.adminMembers.length;
+  $('statPoints').textContent = state.adminMembers.reduce((s, m) => s + Number(m.points || 0), 0);
+  $('statVisits').textContent = data?.visits_count || 0;
+  $('statRevenueMonth').textContent = money.format(Number(data?.revenue_month || 0));
+  $('statRevenueTotal').textContent = money.format(Number(data?.revenue_total || 0));
+  $('statBasket').textContent = money.format(Number(data?.avg_basket || 0));
+  renderBarChart('weekdayChart', data?.visits_by_weekday || []);
+  renderBarChart('hourChart', data?.visits_by_hour || [], 3);
+  $('statRewardsMonth').textContent = data?.rewards_redeemed_month || 0;
+  $('statRewardsTotal').textContent = data?.rewards_redeemed_total || 0;
+  const topReward = (data?.rewards_by_rank || [])[0];
+  $('statTopReward').textContent = topReward ? topReward.label + ' (' + topReward.count + ')' : '—';
+  renderKpis(data);
+  renderClientList();
+  const adminList = $('adminUsersList'); adminList.innerHTML = '';
+  admins.forEach(a => { const item = document.createElement('article'); item.className = 'client-item'; item.innerHTML = '<strong>' + escapeHtml(a.name) + '</strong><small>Admin actif</small>'; adminList.appendChild(item); });
+  renderRankEditor();
+}
+function renderKpis(data) {
+  const months = data?.monthly || [];
+  const cur = months[months.length - 1] || {};
+  state.rewardValues = {};
+  (data?.reward_values || []).forEach(v => { state.rewardValues[v.rank_name] = v.value; });
+  const pct = (a, b) => b > 0 ? Math.round((a / b) * 100) + ' %' : '—';
+  const till = cur.till_revenue;
+  $('kpiCapture').textContent = till ? pct(Number(cur.revenue || 0), Number(till)) : '—';
+  $('kpiRetention').textContent = pct(Number(cur.returning || 0), Number(cur.prev_active || 0));
+  $('kpiMedian').textContent = money.format(Number(data?.median_basket || 0));
+  $('kpiVisitDays').textContent = data?.visit_days_total || 0;
+  $('kpiGiftMonth').textContent = money.format(Number(data?.rewards_value_month || 0));
+  $('kpiGiftTotal').textContent = money.format(Number(data?.rewards_value_total || 0));
+  const warn = $('kpiGiftWarn'), missing = data?.rewards_missing_ranks || [];
+  warn.hidden = !missing.length;
+  warn.textContent = missing.length ? 'Valeur non renseignée pour : ' + missing.join(', ') + ' (' + (data.rewards_without_value || 0) + ' cadeaux non comptés). Renseigne-la dans Réglages > Grades et cadeaux.' : '';
+  const names = ['janv.', 'févr.', 'mars', 'avr.', 'mai', 'juin', 'juil.', 'août', 'sept.', 'oct.', 'nov.', 'déc.'];
+  $('kpiMonths').innerHTML = months.slice().reverse().map(m => {
+    const [y, mo] = m.period.split('-');
+    const rate = m.till_revenue ? pct(Number(m.revenue || 0), Number(m.till_revenue)) : '—';
+    return '<div class="kpi-month"><strong>' + names[Number(mo) - 1] + ' ' + y + '</strong><small>' + money.format(Number(m.revenue || 0)) + ' via l\'appli · ' + (m.active_members || 0) + ' clients · panier médian ' + money.format(Number(m.median_basket || 0)) + ' · capture ' + rate + '</small><label>CA caisse <input type="number" min="0" step="1" inputmode="decimal" data-till="' + m.period + '" value="' + (m.till_revenue ?? '') + '" placeholder="€"></label></div>';
+  }).join('');
+  document.querySelectorAll('[data-till]').forEach(inp => inp.addEventListener('change', async () => {
+    const v = inp.value.trim();
+    const { error } = await db.rpc('admin_set_monthly_revenue', { p_pin: state.adminPin, p_period: inp.dataset.till, p_amount: v === '' ? null : Number(v) });
+    if (error) return toast(error.message);
+    toast('CA caisse enregistré'); await loadAdmin();
+  }));
+}
+function renderBarChart(id, items, labelEvery) {
+  const el = $(id);
+  if (!el) return;
+  const max = Math.max(1, ...items.map(i => Number(i.count || 0)));
+  el.innerHTML = items.map((i, idx) => {
+    const h = Math.round((Number(i.count || 0) / max) * 100);
+    const showLabel = !labelEvery || idx % labelEvery === 0;
+    return '<div class="bar" title="' + escapeHtml(i.label) + ' : ' + Number(i.count || 0) + '"><span style="height:' + Math.max(2, h) + '%"></span><small>' + (showLabel ? escapeHtml(i.label) : '') + '</small></div>';
+  }).join('');
+}
+function daysSinceActivity(m) {
+  const d = new Date(m.updated_at || m.created_at);
+  return isNaN(d) ? null : Math.floor((Date.now() - d.getTime()) / 86400000);
+}
+function activityLabel(days) {
+  if (days === null) return '';
+  if (days <= 0) return "Dernière activité : aujourd'hui";
+  if (days === 1) return 'Dernière activité : hier';
+  return 'Dernière activité : il y a ' + days + ' jours';
+}
+function buildClientCard(m) {
+  const item = document.createElement('article');
+  item.className = 'client-item client-item-admin';
+  const days = daysSinceActivity(m);
+  const atRisk = days !== null && days >= 30;
+  item.innerHTML = '<div><strong>' + escapeHtml(fullName(m) || 'Client') + '</strong><span>' + Number(m.points || 0) + ' pts · ' + escapeHtml(rankFor(m.points).name) + '</span><small>' + escapeHtml(m.code) + ' · ' + escapeHtml(m.phone) + '</small><small class="last-activity' + (atRisk ? ' at-risk' : '') + '">' + activityLabel(days) + '</small></div><div class="client-actions"><button class="mini-action correct-client" type="button" data-client-code="' + escapeHtml(m.code) + '" data-client-points="' + Number(m.points || 0) + '" data-client-name="' + escapeHtml(fullName(m) || m.code) + '">Corriger</button><button class="danger-action delete-client" type="button" data-client-id="' + escapeHtml(m.id) + '" data-client-name="' + escapeHtml(fullName(m) || m.code) + '">Supprimer</button></div>';
+  const rewards = adminRewardHtml(m);
+  if (rewards) item.insertAdjacentHTML('beforeend', rewards);
+  return item;
+}
+function filterMembers(members, query) {
+  const q = String(query || '').trim().toLowerCase();
+  if (!q) return members;
+  return members.filter(m => (fullName(m) || '').toLowerCase().includes(q) || String(m.phone || '').toLowerCase().includes(q) || String(m.code || '').toLowerCase().includes(q));
+}
+function sortMembers(members, mode) {
+  const arr = members.slice();
+  if (mode === 'name_asc') arr.sort((a, b) => (fullName(a) || a.code).localeCompare(fullName(b) || b.code, 'fr'));
+  else if (mode === 'recent') arr.sort((a, b) => new Date(b.updated_at || b.created_at) - new Date(a.updated_at || a.created_at));
+  else if (mode === 'inactive') arr.sort((a, b) => new Date(a.updated_at || a.created_at) - new Date(b.updated_at || b.created_at));
+  else if (mode === 'points_asc') arr.sort((a, b) => Number(a.points || 0) - Number(b.points || 0));
+  else arr.sort((a, b) => Number(b.points || 0) - Number(a.points || 0));
+  return arr;
+}
+function csvCell(value) { return '"' + String(value ?? '').replace(/"/g, '""') + '"'; }
+function exportClientsCsv() {
+  const members = state.adminMembers || [];
+  if (!members.length) return toast('Aucun client à exporter');
+  const rows = [['Prenom', 'Telephone', 'Code', 'Points', 'Grade', 'Inscription']];
+  members.forEach(m => rows.push([
+    fullName(m) || '',
+    m.phone || '',
+    m.code || '',
+    Number(m.points || 0),
+    rankFor(Number(m.points || 0)).name,
+    m.created_at ? new Date(m.created_at).toLocaleDateString('fr-FR') : ''
+  ]));
+  const csv = rows.map(r => r.map(csvCell).join(';')).join('\r\n');
+  const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'clients-agriculture-' + new Date().toISOString().slice(0, 10) + '.csv';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+function renderClientList() {
+  const list = $('clientList'); list.innerHTML = '';
+  const query = $('clientSearch') ? $('clientSearch').value : '';
+  const mode = $('clientSort') ? $('clientSort').value : 'points_desc';
+  const members = filterMembers(state.adminMembers || [], query);
+  if (!members.length) { list.innerHTML = '<p class="hint">Aucun client ne correspond à cette recherche.</p>'; return; }
+  if (mode === 'grade') {
+    state.ranks.slice().reverse().forEach(rank => {
+      const inGroup = members.filter(m => rankFor(Number(m.points || 0)).name === rank.name).sort((a, b) => Number(b.points || 0) - Number(a.points || 0));
+      if (!inGroup.length) return;
+      const header = document.createElement('p');
+      header.className = 'client-group-title';
+      header.textContent = rank.name + ' · ' + inGroup.length;
+      list.appendChild(header);
+      inGroup.forEach(m => list.appendChild(buildClientCard(m)));
+    });
+  } else {
+    sortMembers(members, mode).forEach(m => list.appendChild(buildClientCard(m)));
+  }
+}
+function adminRewardHtml(member) {
+  const points = Number(member.points || 0);
+  const redemptions = member.reward_redemptions || [];
+  const eligible = state.ranks.filter(rank => Number(rank.points_required) > 0 && points >= Number(rank.points_required));
+  if (!eligible.length) return '<div class="admin-rewards empty">Aucun cadeau débloqué pour le moment.</div>';
+  const rows = eligible.map(rank => {
+    const used = redemptions.find(r => r.rank_name === rank.name && Number(r.points_required) === Number(rank.points_required));
+    if (used) {
+      const date = used.created_at ? new Date(used.created_at).toLocaleDateString('fr-FR') : '';
+      return '<article class="admin-reward used"><div><strong>' + escapeHtml(rank.name) + '</strong><span>Utilisé' + (date ? ' le ' + date : '') + '</span><small>' + escapeHtml(rank.reward) + '</small></div></article>';
+    }
+    return '<article class="admin-reward available"><div><strong>' + escapeHtml(rank.name) + '</strong><span>Cadeau disponible</span><small>' + escapeHtml(rank.reward) + '</small></div><button class="mini-action redeem-reward" type="button" data-client-id="' + escapeHtml(member.id) + '" data-client-name="' + escapeHtml(fullName(member) || member.code) + '" data-rank-name="' + escapeHtml(rank.name) + '" data-rank-points="' + Number(rank.points_required) + '" data-rank-reward="' + escapeHtml(rank.reward) + '">Marquer utilisé</button></article>';
+  }).join('');
+  return '<div class="admin-rewards"><p>Cadeaux paliers</p>' + rows + '</div>';
+}
+function renderRankEditor() {
+  const wrap = $('gradeEditor'); wrap.innerHTML = '';
+  state.ranks.forEach((r, i) => { const row = document.createElement('article'); row.className = 'grade-row'; row.innerHTML = '<input data-rank-name="' + i + '" value="' + r.name.replace(/"/g,'&quot;') + '"><input data-rank-points="' + i + '" type="number" value="' + r.points_required + '"><textarea data-rank-reward="' + i + '" rows="2">' + r.reward + '</textarea><label class="gift-value">Valeur du cadeau (€) <input data-rank-value="' + i + '" type="number" min="0" step="0.5" inputmode="decimal" value="' + (state.rewardValues[r.name] ?? '') + '"></label>'; wrap.appendChild(row); });
+}
+function renderClientPreview(member) {
+  const box = $('clientPreview');
+  if (!box) return;
+  if (!member) { box.hidden = true; box.innerHTML = ''; return; }
+  const points = Number(member.points || 0);
+  const rank = rankFor(points);
+  const visits = member.visits || [];
+  const last = visits.length ? new Date(visits[visits.length - 1].created_at).toLocaleDateString('fr-FR') : 'Aucune';
+  box.innerHTML = '<div class="stats"><span><strong>' + points + '</strong> points</span><span><strong>' + escapeHtml(rank.name) + '</strong> grade</span><span><strong>' + visits.length + '</strong> visites</span></div><p class="hint">Dernière visite : ' + escapeHtml(last) + '</p>';
+  box.insertAdjacentHTML('beforeend', adminRewardHtml(member));
+  box.hidden = false;
+}
+async function creditPoints(amount) {
+  const code = $('scanCode').value.trim().toUpperCase();
+  const amt = Math.round(Number(amount || 0));
+  if (!code || !amt) return toast('Sélectionnez un client et un montant');
+  const pts = Math.max(0, amt);
+  const { data: updated, error } = await db.rpc('admin_add_points', { p_pin: state.adminPin, p_code: code, p_amount: pts });
+  if (error) return toast(error.message);
+  $('amountSpent').value = '';
+  toast('Points ajoutés à ' + (fullName(updated) || updated.code));
+  if (state.member && state.member.code === updated.code) renderClient(updated);
+  renderClientPreview(updated);
+  await loadAdmin();
+}
+async function addPoints() { await creditPoints($('amountSpent').value); }
+function hideScanResults() { const list = $('scanResults'); if (list) list.hidden = true; }
+async function selectScanResult(member) {
+  $('scanCode').value = member.code;
+  $('adminClientName').value = fullName(member) || member.code;
+  hideScanResults();
+  $('amountSpent').focus();
+  const full = await getMemberWithVisits(member.code);
+  if (full) renderClientPreview(full);
+}
+function renderScanResults(members) {
+  const list = $('scanResults');
+  if (!list) return;
+  if (!members.length) { list.hidden = true; list.innerHTML = ''; return; }
+  list.innerHTML = '';
+  members.slice(0, 6).forEach(m => {
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.innerHTML = '<strong>' + escapeHtml(fullName(m) || m.code) + '</strong><span>' + escapeHtml(m.phone || '') + ' · ' + Number(m.points || 0) + ' pts</span>';
+    item.addEventListener('click', () => selectScanResult(m));
+    list.appendChild(item);
+  });
+  list.hidden = false;
+}
+async function lookupScanCode() {
+  const raw = $('scanCode').value.trim();
+  const code = raw.toUpperCase();
+  if (code.startsWith('AGRI-') && code.length >= 8) {
+    hideScanResults();
+    const m = await getMemberWithVisits(code);
+    if (m) { $('adminClientName').value = fullName(m) || m.code; renderClientPreview(m); }
+    return;
+  }
+  renderClientPreview(null);
+  if (raw.length < 2) return hideScanResults();
+  renderScanResults(filterMembers(state.adminMembers || [], raw));
+}
+async function deleteClient(memberId, memberName) {
+  if (!memberId) return;
+  if (!confirm('Supprimer ' + memberName + ' ? Ses points et visites seront supprimés.')) return;
+  const { error } = await db.rpc('admin_delete_member', { p_pin: state.adminPin, p_member_id: memberId });
+  if (error) return toast(error.message);
+  if (state.member && state.member.id === memberId) {
+    localStorage.removeItem('agriMemberCode');
+    localStorage.removeItem('agriMemberPhone');
+    state.member = null;
+  }
+  toast('Client supprimé');
+  await loadAdmin();
+}
+async function correctClientPoints(code, currentPoints, memberName) {
+  const value = prompt('Nouveau total de points pour ' + memberName, String(currentPoints || 0));
+  if (value === null) return;
+  const points = Math.max(0, Math.round(Number(value)));
+  if (!Number.isFinite(points)) return toast('Nombre de points invalide');
+  const { data: updated, error } = await db.rpc('admin_set_points', { p_pin: state.adminPin, p_code: code, p_points: points });
+  if (error) return toast(error.message);
+  if (state.member && state.member.code === updated.code) renderClient(updated);
+  toast('Points corrigés');
+  await loadAdmin();
+}
+async function redeemReward(memberId, memberName, rankName, pointsRequired, reward) {
+  if (!confirm('Marquer le cadeau "' + rankName + '" comme utilisé pour ' + memberName + ' ?')) return;
+  const { error } = await db.rpc('admin_redeem_reward', {
+    p_pin: state.adminPin,
+    p_member_id: memberId,
+    p_rank_name: rankName,
+    p_points_required: Number(pointsRequired || 0),
+    p_reward: reward
+  });
+  if (error) return toast(error.message);
+  toast('Cadeau marqué utilisé');
+  await loadAdmin();
+  if (state.member) await refreshMember();
+  const previewBox = $('clientPreview');
+  if (previewBox && !previewBox.hidden) {
+    const code = $('scanCode').value.trim().toUpperCase();
+    if (code) { const m = await getMemberWithVisits(code); if (m) renderClientPreview(m); }
+  }
+}
+async function updateMenu(e) {
+  e.preventDefault();
+  const { data, error } = await db.rpc('admin_update_menu', { p_pin: state.adminPin, p_starter: $('adminStarter').value, p_main: $('adminMain').value, p_dessert: $('adminDessert').value, p_price: $('adminPrice').value });
+  if (error) return toast(error.message);
+  state.menu = data; renderMenu(); toast('Menu mis à jour');
+}
+async function addAdmin(e) {
+  e.preventDefault();
+  const name = $('newAdminName').value.trim() || 'Admin';
+  const pin = $('newAdminPin').value.trim();
+  if (pin.length < 4) return toast('PIN trop court');
+  const { error } = await db.rpc('admin_add_user', { p_pin: state.adminPin, p_name: name, p_new_pin: pin });
+  if (error) return toast(error.message);
+  $('newAdminName').value = ''; $('newAdminPin').value = ''; toast('Admin ajouté'); await loadAdmin();
+}
+async function saveRanks() {
+  const rows = Array.from(document.querySelectorAll('[data-rank-name]')).map((input, idx) => { const i = input.dataset.rankName; return { name: input.value, points_required: Number(document.querySelector('[data-rank-points="' + i + '"]').value || 0), reward: document.querySelector('[data-rank-reward="' + i + '"]').value, sort_order: idx + 1 }; });
+  const { error } = await db.rpc('admin_save_ranks', { p_pin: state.adminPin, p_ranks: rows });
+  if (error) return toast(error.message);
+  const values = Array.from(document.querySelectorAll('[data-rank-value]')).map(input => ({ rank_name: document.querySelector('[data-rank-name="' + input.dataset.rankValue + '"]').value, value: input.value.trim() === '' ? null : Number(input.value) }));
+  const vr = await db.rpc('admin_set_reward_values', { p_pin: state.adminPin, p_values: values });
+  if (vr.error) toast(vr.error.message);
+  await loadPublicData(); await loadAdmin(); toast('Grades enregistrés');
+}
+let scanStream = null, scanTimer = null;
+async function stopScanner() { if (scanTimer) clearInterval(scanTimer); scanTimer = null; if (scanStream) scanStream.getTracks().forEach(t => t.stop()); scanStream = null; $('scanPanel').hidden = true; }
+async function startScanner() {
+  if (!navigator.mediaDevices?.getUserMedia) return toast('Caméra non disponible');
+  if (!('BarcodeDetector' in window)) return toast('Scanner non supporté, saisissez le code');
+  $('scanPanel').hidden = false; $('scanStatus').textContent = 'Ouverture caméra...';
+  try { scanStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } }); $('scanVideo').srcObject = scanStream; await $('scanVideo').play(); const detector = new BarcodeDetector({ formats: ['qr_code'] }); $('scanStatus').textContent = 'Placez le QR code dans le cadre.'; scanTimer = setInterval(async () => { const codes = await detector.detect($('scanVideo')); if (!codes.length) return; let value = codes[0].rawValue || ''; try { const payload = JSON.parse(value); if (payload.code) { $('scanCode').value = payload.code; $('adminClientName').value = [payload.firstName, payload.lastName].filter(Boolean).join(' ') || ''; await lookupScanCode(); } } catch { const match = value.match(/AGRI-[0-9]+/); $('scanCode').value = match ? match[0] : value; await lookupScanCode(); } await stopScanner(); toast('QR scanné'); }, 700); } catch { await stopScanner(); toast('Autorisez la caméra'); }
+}
+function bindUi() {
+  document.querySelectorAll('.tab').forEach(tab => tab.addEventListener('click', () => { document.querySelectorAll('.tab').forEach(t => t.classList.remove('active')); document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active')); tab.classList.add('active'); $(tab.dataset.tab).classList.add('active'); }));
+  document.querySelectorAll('.admin-tab').forEach(tab => tab.addEventListener('click', () => {
+    document.querySelectorAll('.admin-tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.admin-tab-panel').forEach(p => p.classList.remove('active'));
+    tab.classList.add('active');
+    const panel = document.querySelector('.admin-tab-panel[data-admin-panel="' + tab.dataset.adminTab + '"]');
+    if (panel) panel.classList.add('active');
+  }));
+  $('signupForm').addEventListener('submit', signup);
+  $('phoneInput').addEventListener('input', (e) => { e.target.value = formatPhoneDisplay(e.target.value); });
+  const quickQr = $('quickQr');
+  if (quickQr) quickQr.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+    const qrTabBtn = document.querySelector('.tab[data-tab="qr"]');
+    if (qrTabBtn) qrTabBtn.classList.add('active');
+    $('qr').classList.add('active');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  });
+  $('installApp').addEventListener('click', triggerInstall);
+  $('tryInstallApp').addEventListener('click', () => {
+    if (deferredInstallPrompt) return triggerInstall();
+    setupInstallHelp();
+    toast("Utilisez le menu Chrome puis Ajouter à l'écran d'accueil.");
+  });
+  $('closeInstallHelp').addEventListener('click', () => $('installPanel').hidden = true);
+  $('refreshClient').addEventListener('click', refreshMember);
+  const challengeClaim = $('challengeClaim');
+  if (challengeClaim) challengeClaim.addEventListener('click', claimChallenge);
+  const gradeUpClose = $('gradeUpClose');
+  if (gradeUpClose) gradeUpClose.addEventListener('click', () => $('gradeUpBanner').hidden = true);
+  const menuUpdateClose = $('menuUpdateClose');
+  if (menuUpdateClose) menuUpdateClose.addEventListener('click', () => $('menuUpdateBanner').hidden = true);
+  const menuUpdateGo = $('menuUpdateGo');
+  if (menuUpdateGo) menuUpdateGo.addEventListener('click', () => {
+    $('menuUpdateBanner').hidden = true;
+    const menuTabBtn = document.querySelector('.tab[data-tab="menu"]');
+    if (menuTabBtn) menuTabBtn.click();
+  });
+  const adminToggle = $('adminToggle');
+  if (adminToggle) adminToggle.addEventListener('click', () => {
+    localStorage.removeItem('agriAdminPin');
+    state.adminPin = '';
+    $('adminPinInput').value = '';
+    $('pinPanel').hidden = false;
+  });
+  $('unlockAdmin').addEventListener('click', unlockAdmin);
+  $('cancelPin').addEventListener('click', () => { $('pinPanel').hidden = true; if (!state.staffMode) return; });
+  $('closeAdmin').addEventListener('click', () => { $('adminPanel').hidden = true; if (state.staffMode) $('pinPanel').hidden = false; });
+  $('logoutAdmin').addEventListener('click', () => { localStorage.removeItem('agriAdminPin'); state.adminPin = ''; $('adminPanel').hidden = true; toast('Admin déconnecté'); if (state.staffMode) $('pinPanel').hidden = false; });
+  $('addPoints').addEventListener('click', addPoints);
+  $('scanCode').addEventListener('input', lookupScanCode);
+  const quickAmounts = $('quickAmounts');
+  if (quickAmounts) quickAmounts.addEventListener('click', (event) => {
+    const button = event.target.closest('button[data-amount]');
+    if (button) creditPoints(button.dataset.amount);
+  });
+  $('menuForm').addEventListener('submit', updateMenu);
+  $('adminUserForm').addEventListener('submit', addAdmin);
+  $('clientList').addEventListener('click', (event) => {
+    const button = event.target.closest('.delete-client');
+    if (button) deleteClient(button.dataset.clientId, button.dataset.clientName || 'ce client');
+    const correctButton = event.target.closest('.correct-client');
+    if (correctButton) correctClientPoints(correctButton.dataset.clientCode, correctButton.dataset.clientPoints, correctButton.dataset.clientName || 'ce client');
+    const rewardButton = event.target.closest('.redeem-reward');
+    if (rewardButton) redeemReward(rewardButton.dataset.clientId, rewardButton.dataset.clientName || 'ce client', rewardButton.dataset.rankName, rewardButton.dataset.rankPoints, rewardButton.dataset.rankReward);
+  });
+  const clientPreview = $('clientPreview');
+  if (clientPreview) clientPreview.addEventListener('click', (event) => {
+    const rewardButton = event.target.closest('.redeem-reward');
+    if (rewardButton) redeemReward(rewardButton.dataset.clientId, rewardButton.dataset.clientName || 'ce client', rewardButton.dataset.rankName, rewardButton.dataset.rankPoints, rewardButton.dataset.rankReward);
+  });
+  $('saveRanks').addEventListener('click', saveRanks);
+  const exportCsvBtn = $('exportCsv');
+  if (exportCsvBtn) exportCsvBtn.addEventListener('click', exportClientsCsv);
+  const clientSearch = $('clientSearch');
+  if (clientSearch) clientSearch.addEventListener('input', renderClientList);
+  const clientSort = $('clientSort');
+  if (clientSort) clientSort.addEventListener('change', renderClientList);
+  $('openScanner').addEventListener('click', startScanner);
+  $('closeScanner').addEventListener('click', stopScanner);
+  $('copyCode').addEventListener('click', () => navigator.clipboard?.writeText($('memberCode').textContent));
+  $('switchClient').addEventListener('click', () => { localStorage.removeItem('agriMemberCode'); localStorage.removeItem('agriMemberPhone'); state.member = null; $('clientApp').hidden = true; $('signinPanel').hidden = false; });
+  window.addEventListener('focus', refreshMember);
+}
+function maybeOpenStaffEntry() {
+  if (window.location.hash !== STAFF_ENTRY_HASH) return;
+  state.staffMode = true;
+  $('signinPanel').hidden = true;
+  $('clientApp').hidden = true;
+  $('adminPanel').hidden = true;
+  $('pinPanel').hidden = false;
+  const pinInput = $('adminPinInput');
+  if (pinInput) pinInput.focus();
+  tryStoredAdmin();
+}
+async function init() {
+  bindUi();
+  window.addEventListener('hashchange', maybeOpenStaffEntry);
+  if (!ensureConfig()) return;
+  // Service worker sans cache : uniquement pour rendre l'app installable en 1 tap sur Android.
+  try {
+    if ('serviceWorker' in navigator) await navigator.serviceWorker.register('service-worker.js');
+  } catch {}
+  try { await loadPublicData(); await refreshMember(); } catch (e) { toast(e.message || 'Erreur de connexion'); }
+  maybeOpenStaffEntry();
+}
+init();
+
+
